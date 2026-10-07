@@ -1,13 +1,23 @@
 import type { Discovery, Mission, Route, TrackingLocation, UserPreferences, UserStats, WalkHistory } from '@/lib/types'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api'
+const API_URL = `${(process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api')
+  .trim()
+  .replace(/(?:\/api)+\/?$/i, '')
+  .replace(/\/+$/, '')}/api`
 
 interface ApiResponse<T> { success: boolean; data: T; message?: string; code?: string }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+interface HealthResponse { status: 'ok'; service: 'roamly-api' }
+
+function getApiUrl(path: string): string {
+  const normalizedPath = path.replace(/^\/+/, '').replace(/^(?:api\/)+/i, '')
+  return `${API_URL}/${normalizedPath}`
+}
+
+async function fetchJson(path: string, options?: RequestInit): Promise<{ response: Response; payload: unknown }> {
   let response: Response
   try {
-    response = await fetch(`${API_URL}${path}`, {
+    response = await fetch(getApiUrl(path), {
       ...options,
       headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
     })
@@ -15,7 +25,34 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     console.error('[API] Network request failed', path, error)
     throw new Error('Roamly couldn\'t reach the server. Please make sure the backend is running.')
   }
-  const payload = await response.json() as ApiResponse<T>
+
+  const contentType = response.headers.get('content-type') || ''
+  if (!contentType.toLowerCase().includes('json')) {
+    console.error('[API] Expected a JSON response', { path, status: response.status, contentType })
+    throw new Error('Roamly received a non-JSON response. Check that NEXT_PUBLIC_API_URL points to the backend URL ending in /api.')
+  }
+
+  try {
+    return { response, payload: await response.json() as unknown }
+  } catch (error) {
+    console.error('[API] Invalid JSON response', path, error)
+    throw new Error('Roamly received an invalid JSON response from the backend.')
+  }
+}
+
+function isApiResponse<T>(payload: unknown): payload is ApiResponse<T> {
+  return typeof payload === 'object' && payload !== null
+    && 'success' in payload && typeof payload.success === 'boolean'
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const { response, payload: responsePayload } = await fetchJson(path, options)
+  if (!isApiResponse<T>(responsePayload)) {
+    console.error('[API] Unexpected response shape', { path, status: response.status })
+    throw new Error('Roamly received an unexpected response from the backend.')
+  }
+  const payload = responsePayload
+
   if (path === '/walks' && options?.method === 'POST') {
     console.info(`[DEBUG] POST /api/walks status=${response.status}`)
     console.info('[DEBUG] POST /api/walks response=', { success: payload.success, code: payload.code, hasData: Boolean(payload.data) })
@@ -76,7 +113,16 @@ export const createWalk = async (preferences: UserPreferences, location: { latit
     body: JSON.stringify({ preferences, location }),
   }))
 )
-export const checkHealth = () => request<never>('/health')
+export const checkHealth = async (): Promise<HealthResponse> => {
+  const { response, payload } = await fetchJson('/health')
+  if (!response.ok || typeof payload !== 'object' || payload === null
+    || !('status' in payload) || payload.status !== 'ok'
+    || !('service' in payload) || payload.service !== 'roamly-api') {
+    console.error('[API] Health check failed', { status: response.status, payload })
+    throw new Error('Roamly backend health check failed.')
+  }
+  return payload as HealthResponse
+}
 export const getWalk = (id: string) => request<BackendWalk>(`/walks/${id}`)
 export const startWalk = (id: string) => request<BackendWalk>(`/walks/${id}/start`, { method: 'POST' })
 export const completeWalk = (id: string, summary?: WalkCompletionSummary) => request<BackendWalk>(`/walks/${id}/complete`, {

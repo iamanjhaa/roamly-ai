@@ -20,7 +20,7 @@ const success = (res, data, status = 200) => res.status(status).json({ success: 
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const validObjectId = (value) => mongoose.isValidObjectId(value);
 
-app.get('/api/health', (_req, res) => res.json({ success: true, message: 'Roamly API is running' }));
+app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'roamly-api' }));
 
 app.post('/api/walks', asyncRoute(async (req, res) => {
   const startedAt = Date.now();
