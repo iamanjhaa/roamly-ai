@@ -97,6 +97,7 @@ export interface Mission {
   instruction: string;
   duration: number; // in minutes
   phoneAway: boolean;
+  completed?: boolean;
   title?: string;
   description?: string;
   type?: string;

@@ -156,6 +156,7 @@ export default function Page() {
   const [discoveryPreview, setDiscoveryPreview] = useState('')
   const [discoveryError, setDiscoveryError] = useState('')
   const [discovery, setDiscovery] = useState<Discovery | null>(null)
+  const [discoveryOpen, setDiscoveryOpen] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [loadingMessage, setLoadingMessage] = useState('')
@@ -458,17 +459,22 @@ export default function Page() {
 
   const finishMission = async () => {
     const mission = state.currentWalk?.missions[state.currentMissionIndex]
-    if (mission) {
+    if (mission && !mission.completed) {
       try {
         await completeMission(mission.id)
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : 'Could not save mission progress.')
         return
       }
+      setState((current) => ({
+        ...current,
+        currentWalk: current.currentWalk ? {
+          ...current.currentWalk,
+          missions: current.currentWalk.missions.map((item) => item.id === mission.id ? { ...item, completed: true } : item),
+        } : current.currentWalk,
+      }))
     }
-    setDiscoveryPreview('')
-    setDiscovery(null)
-    go('discovery')
+    setDiscoveryOpen(true)
   }
 
   const continueFromDiscovery = async () => {
@@ -479,7 +485,8 @@ export default function Page() {
     if (state.currentMissionIndex < (state.currentWalk?.missions.length || 0) - 1) {
       if (state.currentWalk?.id) {
         const missions = await getMissions(state.currentWalk.id)
-        setState((current) => ({ ...current, currentMissionIndex: current.currentMissionIndex + 1, currentScreen: 'mission', currentWalk: current.currentWalk ? { ...current.currentWalk, missions } : current.currentWalk }))
+        setDiscoveryOpen(false)
+        setState((current) => ({ ...current, currentMissionIndex: current.currentMissionIndex + 1, currentScreen: 'walk', currentWalk: current.currentWalk ? { ...current.currentWalk, missions } : current.currentWalk }))
       }
     } else {
       endWalk()
@@ -508,6 +515,36 @@ export default function Page() {
     } finally {
       setLoading(false)
       setLoadingMessage('')
+    }
+  }
+
+  const uploadDiscoveryImage = (file: File) => {
+    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']
+    const allowedExtensions = /\.(jpe?g|png|webp)$/i
+    setDiscoveryError('')
+    if (!allowedTypes.includes(file.type.toLowerCase()) && !allowedExtensions.test(file.name)) {
+      setDiscoveryError('Choose a JPG, JPEG, PNG, or WEBP photo.')
+      return
+    }
+    if (!file.size || file.size > MAX_DISCOVERY_UPLOAD_BYTES) {
+      setDiscoveryError('Photos must be 12 MB or smaller. Choose a smaller photo and try again.')
+      return
+    }
+    const reader = new FileReader()
+    reader.onerror = () => setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+    reader.onabort = () => setDiscoveryError('Reading the selected photo was cancelled. Choose it again and retry.')
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+        return
+      }
+      setDiscoveryPreview(reader.result)
+      setDiscovery(null)
+    }
+    try {
+      reader.readAsDataURL(file)
+    } catch {
+      setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
     }
   }
 
@@ -564,67 +601,33 @@ export default function Page() {
           <div className="avatar">AR</div>
         </header>
         <main className="content">
-          {screen === 'home' && <HomeScreen stats={state.stats} onStart={startFlow} onHow={() => document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' })} discoveryPreview={discoveryPreview} discovery={discovery} loading={loading} error={discoveryError} onUpload={(file) => {
-            const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
-            setDiscoveryError('')
-            if (!allowedTypes.includes(file.type)) {
-              setDiscoveryError('Choose a JPEG, PNG, or WebP photo.')
-              return
-            }
-            if (!file.size || file.size > MAX_DISCOVERY_UPLOAD_BYTES) {
-              setDiscoveryError('Photos must be 12 MB or smaller. Choose a smaller photo and try again.')
-              return
-            }
-            const reader = new FileReader()
-            reader.onerror = () => setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
-            reader.onabort = () => setDiscoveryError('Reading the selected photo was cancelled. Choose it again and retry.')
-            reader.onload = () => {
-              if (typeof reader.result !== 'string') {
-                setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
-                return
-              }
-              setDiscoveryPreview(reader.result)
-              setDiscovery(null)
-            }
-            try {
-              reader.readAsDataURL(file)
-            } catch {
-              setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
-            }
-          }} onAnalyze={() => analyzeDiscoveryImage(discoveryPreview, true)} onRetry={() => analyzeDiscoveryImage(discoveryPreview, true)} onRemove={() => { setDiscoveryPreview(''); setDiscovery(null); setDiscoveryError('') }} />}
+          {screen === 'home' && <HomeScreen stats={state.stats} onStart={startFlow} onHow={() => document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' })} />}
           {screen === 'mood' && <MoodScreen selected={state.preferences?.mood} onSelect={selectMood} customMood={customMood} setCustomMood={setCustomMood} onBack={() => go('home')} onContinue={() => go('preferences')} />}
           {screen === 'preferences' && <PreferencesScreen onBack={() => go('mood')} onCreate={createPreferences} loading={loading} loadingMessage={loadingMessage} />}
           {screen === 'route' && state.route && <RouteScreen route={state.route} tracking={tracking} onBack={() => go('preferences')} onStart={beginWalk} onChange={() => go('preferences')} />}
-          {screen === 'walk' && state.currentWalk && <ActiveWalkScreen mission={state.currentWalk.missions[state.currentMissionIndex] || null} route={state.currentWalk.route} tracking={tracking} onMission={finishMission} onPause={pauseWalk} onResume={resumeWalk} onEnd={endWalk} onRetryGps={retryGps} onFinish={() => go('complete')} />}
+          {screen === 'walk' && state.currentWalk && <ActiveWalkScreen
+            mission={state.currentWalk.missions[state.currentMissionIndex] || null}
+            route={state.currentWalk.route}
+            tracking={tracking}
+            discoveryOpen={discoveryOpen}
+            discoveryPreview={discoveryPreview}
+            discovery={discovery}
+            discoveryLoading={loading}
+            discoveryError={discoveryError}
+            onMission={finishMission}
+            onCloseDiscovery={() => setDiscoveryOpen(false)}
+            onUpload={uploadDiscoveryImage}
+            onAnalyze={() => analyzeDiscoveryImage(discoveryPreview)}
+            onRetryAnalysis={() => analyzeDiscoveryImage(discoveryPreview)}
+            onRemoveImage={() => { setDiscoveryPreview(''); setDiscovery(null); setDiscoveryError('') }}
+            onContinueDiscovery={continueFromDiscovery}
+            onPause={pauseWalk}
+            onResume={resumeWalk}
+            onEnd={endWalk}
+            onRetryGps={retryGps}
+            onFinish={() => go('complete')}
+          />}
           {screen === 'mission' && state.currentWalk?.missions[state.currentMissionIndex] && <MissionScreen mission={state.currentWalk.missions[state.currentMissionIndex]} missionIndex={state.currentMissionIndex} onComplete={finishMission} />}
-          {screen === 'discovery' && <DiscoveryScreen preview={discoveryPreview} result={discovery} loading={loading} error={discoveryError} onUpload={(file) => {
-            const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
-            setDiscoveryError('')
-            if (!allowedTypes.includes(file.type)) {
-              setDiscoveryError('Choose a JPEG, PNG, or WebP photo.')
-              return
-            }
-            if (!file.size || file.size > MAX_DISCOVERY_UPLOAD_BYTES) {
-              setDiscoveryError('Photos must be smaller than 12 MB. Choose a smaller photo and try again.')
-              return
-            }
-            const reader = new FileReader()
-            reader.onerror = () => setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
-            reader.onabort = () => setDiscoveryError('Reading the selected photo was cancelled. Choose it again and retry.')
-            reader.onload = () => {
-              if (typeof reader.result !== 'string') {
-                setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
-                return
-              }
-              setDiscoveryPreview(reader.result)
-              setDiscovery(null)
-            }
-            try {
-              reader.readAsDataURL(file)
-            } catch {
-              setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
-            }
-          }} onAnalyze={() => analyzeDiscoveryImage(discoveryPreview)} onRetry={() => analyzeDiscoveryImage(discoveryPreview)} onRemove={() => { setDiscoveryPreview(''); setDiscovery(null); setDiscoveryError('') }} onContinue={continueFromDiscovery} />}
           {screen === 'complete' && <CompleteScreen onReflect={() => go('reflection')} />}
           {screen === 'reflection' && <ReflectionScreen selected={selectedAfterMood} setSelected={setSelectedAfterMood} value={reflection} setValue={setReflection} onSave={saveReflection} />}
           {screen === 'history' && <HistoryScreen walks={state.walks} onStart={startFlow} />}
@@ -683,18 +686,10 @@ function OutdoorJourney() {
   return <section className="outdoor-journey"><div className="section-label">A small outdoor journey</div><div className="journey-steps">{stages.map(([emoji, label], index) => <div className={cn('journey-stage', index === active && 'journey-stage-active')} key={label}><span>{emoji}</span><strong>{label}</strong>{index < stages.length - 1 && <b>↓</b>}</div>)}</div></section>
 }
 
-function HomeScreen({ stats, onStart, onHow, discoveryPreview, discovery, loading, error, onUpload, onAnalyze, onRetry, onRemove }: {
+function HomeScreen({ stats, onStart, onHow }: {
   stats: AppState['stats']
   onStart: () => void
   onHow: () => void
-  discoveryPreview: string
-  discovery: Discovery | null
-  loading: boolean
-  error: string
-  onUpload: (file: File) => void
-  onAnalyze: () => void
-  onRetry: () => void
-  onRemove: () => void
 }) {
   return <div className="home-page">
     <section className="hero-section">
@@ -706,14 +701,6 @@ function HomeScreen({ stats, onStart, onHow, discoveryPreview, discovery, loadin
         <div className="hero-note"><span className="pulse-dot" /> The best AI interaction is sometimes walking away from the screen.</div>
       </div>
       <HeroSlideshow />
-    </section>
-    <section className="home-discovery-section" aria-labelledby="home-discovery-title">
-      <div className="home-discovery-heading">
-        <div className="section-label">A little outdoor curiosity</div>
-        <h2 id="home-discovery-title">What did you discover?</h2>
-        <p>Upload a photo or take one now. Local Gemma will help you notice what is really there.</p>
-      </div>
-      <DiscoveryScreen preview={discoveryPreview} result={discovery} loading={loading} error={error} onUpload={onUpload} onAnalyze={onAnalyze} onRetry={onRetry} onRemove={onRemove} standalone />
     </section>
     <NatureLove />
     <OutdoorJourney />
@@ -817,7 +804,28 @@ function RouteScreen({ route, tracking, onBack, onStart, onChange }: { route: Ro
 
 function UsersIcon() { return <Activity /> }
 
-function ActiveWalkScreen({ mission, route, tracking, onMission, onPause, onResume, onEnd, onRetryGps, onFinish }: { mission: Mission | null; route: Route; tracking: WalkTrackingState; onMission: () => void; onPause: () => void; onResume: () => void; onEnd: () => void; onRetryGps: () => void; onFinish: () => void }) {
+function ActiveWalkScreen({ mission, route, tracking, discoveryOpen, discoveryPreview, discovery, discoveryLoading, discoveryError, onMission, onCloseDiscovery, onUpload, onAnalyze, onRetryAnalysis, onRemoveImage, onContinueDiscovery, onPause, onResume, onEnd, onRetryGps, onFinish }: {
+  mission: Mission | null
+  route: Route
+  tracking: WalkTrackingState
+  discoveryOpen: boolean
+  discoveryPreview: string
+  discovery: Discovery | null
+  discoveryLoading: boolean
+  discoveryError: string
+  onMission: () => void
+  onCloseDiscovery: () => void
+  onUpload: (file: File) => void
+  onAnalyze: () => void
+  onRetryAnalysis: () => void
+  onRemoveImage: () => void
+  onContinueDiscovery: () => void
+  onPause: () => void
+  onResume: () => void
+  onEnd: () => void
+  onRetryGps: () => void
+  onFinish: () => void
+}) {
   const totalRouteKm = tracking.completedRouteDistanceKm + tracking.remainingDistanceKm
   const osrmDuration = Number.isFinite(route.duration) && route.duration > 0 ? route.duration : 0
   const estimatedMinutes = totalRouteKm > 0 && osrmDuration > 0
@@ -827,7 +835,7 @@ function ActiveWalkScreen({ mission, route, tracking, onMission, onPause, onResu
   const summary = tracking.arrived || tracking.isEnded
   const destinationName = route.destination.name.trim()
 
-  return <div className="active-walk-page"><div className="walk-topline"><span className="walk-status"><span className="live-dot" /> {summary ? (tracking.arrived ? 'Walk complete' : 'Walk ended') : 'Walk in progress'}</span></div><TrackingStatus tracking={tracking} /><div className="active-map-wrap"><RoamlyMap route={route} location={tracking.location} walkedPath={tracking.walkedPath} compact /></div>{summary ? <section className="walk-summary" aria-live="polite"><div className="section-label">{tracking.arrived ? 'Destination reached' : 'Walk summary'}</div><h1>{tracking.arrived ? '✓ You made it!' : 'Walk complete'}</h1><div className="walk-summary-stats"><div><strong>{tracking.distanceWalkedKm.toFixed(2)} km</strong><span>Distance walked</span></div><div><strong>{formatElapsedTime(tracking.elapsedSeconds)}</strong><span>Time taken</span></div></div><p><strong>Destination:</strong> {destinationName}</p><button className="button button-dark button-large full-width" onClick={onFinish}>Finish Walk <Check /></button></section> : <><section className="live-walk-dashboard" aria-label="Walk in progress"><div className="live-walk-heading"><div><span className="section-label">Walk in progress</span><strong>{formatElapsedTime(tracking.elapsedSeconds)}</strong><span>Active time</span></div>{tracking.status === 'permission-denied' || tracking.status === 'unavailable' || tracking.status === 'timeout' || tracking.status === 'error' ? <button className="button button-ghost" onClick={onRetryGps}>Retry location</button> : null}</div><div className="live-walk-metrics"><div><strong>{tracking.distanceWalkedKm.toFixed(2)} km</strong><span>Walked</span></div><div><strong>{tracking.remainingDistanceKm.toFixed(2)} km</strong><span>Remaining</span></div><div><strong>{safeEstimatedMinutes > 0 ? `About ${Math.max(1, Math.round(safeEstimatedMinutes))} min` : 'Almost there'}</strong><span>Estimated time left</span></div></div><div className="live-walk-actions">{tracking.isPaused ? <button className="button button-primary" onClick={onResume}><Play /> Resume Walk</button> : <button className="button button-ghost" onClick={onPause}><Pause /> Pause Walk</button>}<button className="button button-ghost" onClick={onEnd}>End Walk</button></div></section>{mission && <div className="mission-card"><div className="mission-top"><span>Mission {String(mission.number).padStart(2, '0')}</span><span className="mission-time"><Activity /> {mission.duration} min</span></div><div className="mission-icon"><Target /></div><h1>{mission.instruction}</h1><div className="put-away"><Pause /> <span><strong>Put your phone away.</strong><br />Explore for a few minutes.</span></div><button className="button button-dark button-large full-width" onClick={onMission}>I Found Something <ArrowRight /></button></div>}{mission && <div className="phone-free-note"><Shield /> Your screen will be here when you get back.</div>}</>}</div>
+  return <div className="active-walk-page"><div className="walk-topline"><span className="walk-status"><span className="live-dot" /> {summary ? (tracking.arrived ? 'Walk complete' : 'Walk ended') : 'Walk in progress'}</span></div><TrackingStatus tracking={tracking} /><div className="active-map-wrap"><RoamlyMap route={route} location={tracking.location} walkedPath={tracking.walkedPath} compact /></div>{summary ? <section className="walk-summary" aria-live="polite"><div className="section-label">{tracking.arrived ? 'Destination reached' : 'Walk summary'}</div><h1>{tracking.arrived ? '✓ You made it!' : 'Walk complete'}</h1><div className="walk-summary-stats"><div><strong>{tracking.distanceWalkedKm.toFixed(2)} km</strong><span>Distance walked</span></div><div><strong>{formatElapsedTime(tracking.elapsedSeconds)}</strong><span>Time taken</span></div></div><p><strong>Destination:</strong> {destinationName}</p><button className="button button-dark button-large full-width" onClick={onFinish}>Finish Walk <Check /></button></section> : <><section className="live-walk-dashboard" aria-label="Walk in progress"><div className="live-walk-heading"><div><span className="section-label">Walk in progress</span><strong>{formatElapsedTime(tracking.elapsedSeconds)}</strong><span>Active time</span></div>{tracking.status === 'permission-denied' || tracking.status === 'unavailable' || tracking.status === 'timeout' || tracking.status === 'error' ? <button className="button button-ghost" onClick={onRetryGps}>Retry location</button> : null}</div><div className="live-walk-metrics"><div><strong>{tracking.distanceWalkedKm.toFixed(2)} km</strong><span>Walked</span></div><div><strong>{tracking.remainingDistanceKm.toFixed(2)} km</strong><span>Remaining</span></div><div><strong>{safeEstimatedMinutes > 0 ? `About ${Math.max(1, Math.round(safeEstimatedMinutes))} min` : 'Almost there'}</strong><span>Estimated time left</span></div></div><div className="live-walk-actions">{tracking.isPaused ? <button className="button button-primary" onClick={onResume}><Play /> Resume Walk</button> : <button className="button button-ghost" onClick={onPause}><Pause /> Pause Walk</button>}<button className="button button-ghost" onClick={onEnd}>End Walk</button></div></section><div className="mission-card">{mission ? <><div className="mission-top"><span>Mission {String(mission.number).padStart(2, '0')}</span><span className="mission-time"><Activity /> {mission.duration} min</span></div><div className="mission-icon"><Target /></div><h1>{mission.instruction}</h1><div className="put-away"><Pause /> <span><strong>Put your phone away.</strong><br />Explore for a few minutes.</span></div></> : <><div className="section-label">Your walking mission</div><h2>Your next discovery is waiting.</h2></>}<button className="button button-dark button-large full-width" onClick={onMission}>I Found Something <ArrowRight /></button></div>{mission && <div className="phone-free-note"><Shield /> Your screen will be here when you get back.</div>}{discoveryOpen && <section className="walk-discovery-panel" aria-labelledby="walk-discovery-title"><div className="walk-discovery-panel-heading"><div><div className="section-label">Real-world discovery</div><h2 id="walk-discovery-title">What did you discover?</h2></div><button type="button" className="button button-ghost" onClick={onCloseDiscovery} aria-label="Close image discovery">Close</button></div><DiscoveryScreen preview={discoveryPreview} result={discovery} loading={discoveryLoading} error={discoveryError} onUpload={onUpload} onAnalyze={onAnalyze} onRetry={onRetryAnalysis} onRemove={onRemoveImage} onContinue={onContinueDiscovery} standalone /></section>}</>}</div>
 }
 
 function MissionScreen({ mission, missionIndex, onComplete }: { mission: Mission; missionIndex: number; onComplete: () => void }) { return <div className="mission-full-page"><span className="mission-kicker">Next mission · {String(missionIndex + 1).padStart(2, '0')}</span><div className="mission-big-icon"><Target /></div><h1>{mission.instruction}</h1><p className="mission-big-description">{mission.description}</p><div className="mission-duration"><Activity /> About {mission.duration} minutes</div><div className="mission-quote"><Leaf /> <span>There&apos;s nothing to tap here.<br /><strong>Just go explore.</strong></span></div><button className="button button-dark button-large" onClick={onComplete}>I&apos;m ready <ArrowRight /></button></div> }
@@ -857,21 +865,18 @@ function DiscoveryScreen({ preview, result, loading, error, onUpload, onAnalyze,
     {!standalone && <PageHeader eyebrow="Real-world discovery" title="What did you discover?" description="Take a photo or upload one to let local Gemma analyze it." />}
     <div className={cn('upload-card', preview && 'upload-card-uploaded')}>
       <div className="upload-visual">{preview ? <img src={preview} alt="Your uploaded discovery" className="discovery-preview" /> : <><Camera /><span>Point your camera at something interesting</span></>}</div>
-      {!preview
-        ? <div className="upload-actions">
-          <input ref={cameraInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" capture="environment" disabled={loading} onChange={handleFile} aria-label="Take a photo for discovery" />
-          <input ref={uploadInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={loading} onChange={handleFile} aria-label="Choose a discovery image" />
-          <button type="button" className="button button-primary" disabled={loading} onClick={() => cameraInputRef.current?.click()}><Camera /> Take Photo</button>
-          <button type="button" className="button button-ghost" disabled={loading} onClick={() => uploadInputRef.current?.click()}><Upload /> Upload Image</button>
-        </div>
-        : <div className="upload-actions">
-          <button type="button" className="button button-primary" disabled={loading} onClick={onAnalyze}>{loading ? 'Analyzing…' : 'Analyze with AI'} <Sparkles /></button>
-          <input ref={cameraInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" capture="environment" disabled={loading} onChange={handleFile} aria-label="Take a replacement photo" />
-          <input ref={uploadInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={loading} onChange={handleFile} aria-label="Choose a replacement discovery image" />
-          <button type="button" className="button button-ghost" disabled={loading} onClick={() => cameraInputRef.current?.click()}><Camera /> Take another</button>
-          <button type="button" className="button button-ghost" disabled={loading} onClick={() => uploadInputRef.current?.click()}><Upload /> Change Image</button>
+      <div className="upload-actions">
+        <input ref={cameraInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" capture="environment" disabled={loading} onChange={handleFile} aria-label={preview ? 'Take a replacement photo' : 'Take a photo for discovery'} />
+        <input ref={uploadInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={loading} onChange={handleFile} aria-label={preview ? 'Choose a replacement discovery image' : 'Choose a discovery image'} />
+        {preview && <button type="button" className="button button-primary" disabled={loading} onClick={onAnalyze}>{loading ? 'Analyzing…' : 'Analyze with AI'} <Sparkles /></button>}
+        {!preview && <button type="button" className="button button-primary" disabled={loading} onClick={() => cameraInputRef.current?.click()}><Camera /> Take Photo</button>}
+        {preview && <button type="button" className="button button-ghost" disabled={loading} onClick={() => cameraInputRef.current?.click()}><Camera /> Take another</button>}
+        <button type="button" className="button button-ghost" disabled={loading} onClick={() => uploadInputRef.current?.click()}><Upload /> Upload Image</button>
+        {preview && <>
+          <button type="button" className="button button-ghost" disabled={loading} onClick={() => uploadInputRef.current?.click()}>Change Image</button>
           <button type="button" className="button button-ghost" disabled={loading} onClick={onRemove}>Remove Image</button>
-        </div>}
+        </>}
+      </div>
     </div>
     {error && <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">
       <span>{error}</span>
