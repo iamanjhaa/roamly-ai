@@ -5,6 +5,7 @@ const {
   hasInstitutionalAssociation,
   rankPlaces,
   deduplicatePlaces,
+  normalizeNominatimCandidates,
 } = require('./routeService');
 
 function candidate(name, tags = {}, category = 'park', context = {}) {
@@ -49,6 +50,22 @@ test('accepts a harmless candidate name with confirmed municipal context', () =>
   assert.equal(isPublicRecreationalPlace(place), true);
 });
 
+test('accepts public community gardens with explicit public access', () => {
+  assert.equal(isPublicRecreationalPlace(candidate(
+    'West 123rd Street Community Garden',
+    { access: 'yes' },
+    'garden',
+  )), true);
+});
+
+test('accepts city parks operated by a parks and recreation department', () => {
+  assert.equal(isPublicRecreationalPlace(candidate(
+    'Garden of Love',
+    { operator: 'New York City Department of Parks and Recreation' },
+    'garden',
+  )), true);
+});
+
 test('accepts clearly public recreational destinations', () => {
   for (const [name, category] of [
     ['City Park', 'park'],
@@ -88,4 +105,21 @@ test('deduplicates provider copies by id, coordinates, and normalized name', () 
     { id: 'osm-3', name: 'Riverside Ghat', latitude: 29.88, longitude: 77.9 },
   ]);
   assert.deepEqual(deduplicated.map((place) => place.name), ['City Park', 'Riverside Ghat']);
+});
+
+test('preserves Nominatim public-access evidence for destination filtering', () => {
+  const [place] = normalizeNominatimCandidates([{
+    place_id: 42,
+    name: 'Green Space',
+    type: 'park',
+    class: 'leisure',
+    lat: '29.87',
+    lon: '77.89',
+    extratags: { access: 'public', operator: 'City Municipal Corporation' },
+  }]);
+  place.context = { checked: true, institutionalNearby: false };
+
+  assert.equal(place.tags.access, 'public');
+  assert.equal(place.tags.operator, 'City Municipal Corporation');
+  assert.equal(isPublicRecreationalPlace(place), true);
 });

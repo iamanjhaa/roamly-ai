@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
+import Image from 'next/image'
 import {
   Activity,
   ArrowLeft,
@@ -39,8 +40,17 @@ import {
 } from 'lucide-react'
 import type { AppState, Discovery, Mission, Mood, Route, TrackingLocation, UserPreferences, UserStats, WalkHistory, WalkTrackingState } from '@/lib/types'
 import { cn } from '@/lib/utils'
-import { checkHealth, completeMission, completeWalk, createDiscovery, createWalk, getMissions, getProfileStats, getWalkHistory, startWalk, saveReflection as saveReflectionApi } from '@/lib/api'
+import { analyzeDiscoveryImage as analyzeDiscoveryImageApi, checkHealth, completeMission, completeWalk, createDiscovery, createWalk, getMissions, getProfileStats, getWalkHistory, startWalk, saveReflection as saveReflectionApi } from '@/lib/api'
 import RoamlyMap from '@/components/roamly-map'
+
+const MAX_DISCOVERY_UPLOAD_BYTES = 12 * 1024 * 1024
+const HERO_SLIDES = [
+  '/project-image/roamly-1.jpeg',
+  '/project-image/roamly-2.jpeg',
+  '/project-image/roamly-3.jpeg',
+  '/project-image/roamly-4.jpeg',
+  '/project-image/roamly-5.jpeg',
+]
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number) {
   const radians = Math.PI / 180
@@ -144,6 +154,7 @@ export default function Page() {
   const [selectedAfterMood, setSelectedAfterMood] = useState<Mood | null>(null)
   const [reflection, setReflection] = useState('')
   const [discoveryPreview, setDiscoveryPreview] = useState('')
+  const [discoveryError, setDiscoveryError] = useState('')
   const [discovery, setDiscovery] = useState<Discovery | null>(null)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -476,6 +487,30 @@ export default function Page() {
     }
   }
 
+  const analyzeDiscoveryImage = async (image: string, standalone = false) => {
+    if (!standalone && !state.currentWalk?.id) {
+      setDiscoveryError('Your walk could not be found. Return to the walk and try again.')
+      return
+    }
+    setLoading(true)
+    setLoadingMessage('Local Gemma is looking closely…')
+    setDiscoveryError('')
+    try {
+      const result = standalone
+        ? await analyzeDiscoveryImageApi(image)
+        : await createDiscovery(state.currentWalk!.id, {
+          image,
+          missionId: state.currentWalk!.missions[state.currentMissionIndex]?.id,
+        })
+      setDiscovery(result)
+    } catch (requestError) {
+      setDiscoveryError(requestError instanceof Error ? requestError.message : 'Local Gemma could not analyze this image. Please retry.')
+    } finally {
+      setLoading(false)
+      setLoadingMessage('')
+    }
+  }
+
   const saveReflection = async () => {
     if (state.currentWalk?.id) {
       try {
@@ -529,34 +564,67 @@ export default function Page() {
           <div className="avatar">AR</div>
         </header>
         <main className="content">
-          {screen === 'home' && <HomeScreen stats={state.stats} onStart={startFlow} onHow={() => document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' })} />}
+          {screen === 'home' && <HomeScreen stats={state.stats} onStart={startFlow} onHow={() => document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' })} discoveryPreview={discoveryPreview} discovery={discovery} loading={loading} error={discoveryError} onUpload={(file) => {
+            const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
+            setDiscoveryError('')
+            if (!allowedTypes.includes(file.type)) {
+              setDiscoveryError('Choose a JPEG, PNG, or WebP photo.')
+              return
+            }
+            if (!file.size || file.size > MAX_DISCOVERY_UPLOAD_BYTES) {
+              setDiscoveryError('Photos must be 12 MB or smaller. Choose a smaller photo and try again.')
+              return
+            }
+            const reader = new FileReader()
+            reader.onerror = () => setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+            reader.onabort = () => setDiscoveryError('Reading the selected photo was cancelled. Choose it again and retry.')
+            reader.onload = () => {
+              if (typeof reader.result !== 'string') {
+                setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+                return
+              }
+              setDiscoveryPreview(reader.result)
+              setDiscovery(null)
+            }
+            try {
+              reader.readAsDataURL(file)
+            } catch {
+              setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+            }
+          }} onAnalyze={() => analyzeDiscoveryImage(discoveryPreview, true)} onRetry={() => analyzeDiscoveryImage(discoveryPreview, true)} onRemove={() => { setDiscoveryPreview(''); setDiscovery(null); setDiscoveryError('') }} />}
           {screen === 'mood' && <MoodScreen selected={state.preferences?.mood} onSelect={selectMood} customMood={customMood} setCustomMood={setCustomMood} onBack={() => go('home')} onContinue={() => go('preferences')} />}
           {screen === 'preferences' && <PreferencesScreen onBack={() => go('mood')} onCreate={createPreferences} loading={loading} loadingMessage={loadingMessage} />}
           {screen === 'route' && state.route && <RouteScreen route={state.route} tracking={tracking} onBack={() => go('preferences')} onStart={beginWalk} onChange={() => go('preferences')} />}
           {screen === 'walk' && state.currentWalk && <ActiveWalkScreen mission={state.currentWalk.missions[state.currentMissionIndex] || null} route={state.currentWalk.route} tracking={tracking} onMission={finishMission} onPause={pauseWalk} onResume={resumeWalk} onEnd={endWalk} onRetryGps={retryGps} onFinish={() => go('complete')} />}
           {screen === 'mission' && state.currentWalk?.missions[state.currentMissionIndex] && <MissionScreen mission={state.currentWalk.missions[state.currentMissionIndex]} missionIndex={state.currentMissionIndex} onComplete={finishMission} />}
-          {screen === 'discovery' && <DiscoveryScreen preview={discoveryPreview} result={discovery} onUpload={async (file) => {
+          {screen === 'discovery' && <DiscoveryScreen preview={discoveryPreview} result={discovery} loading={loading} error={discoveryError} onUpload={(file) => {
             const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
-            if (!allowedTypes.includes(file.type) || file.size > 1.5 * 1024 * 1024) {
-              setError('Please choose a JPEG, PNG, or WebP image smaller than 1.5 MB.')
+            setDiscoveryError('')
+            if (!allowedTypes.includes(file.type)) {
+              setDiscoveryError('Choose a JPEG, PNG, or WebP photo.')
+              return
+            }
+            if (!file.size || file.size > MAX_DISCOVERY_UPLOAD_BYTES) {
+              setDiscoveryError('Photos must be smaller than 12 MB. Choose a smaller photo and try again.')
               return
             }
             const reader = new FileReader()
-            reader.onload = async () => {
-              const image = String(reader.result)
-              setDiscoveryPreview(image)
-              if (state.currentWalk?.id) {
-                setLoading(true)
-                try {
-                  const saved = await createDiscovery(state.currentWalk.id, { image, missionId: state.currentWalk.missions[state.currentMissionIndex]?.id })
-                  setDiscovery(saved)
-                } catch (requestError) {
-                  setError(requestError instanceof Error ? requestError.message : 'Could not analyze discovery.')
-                } finally { setLoading(false) }
+            reader.onerror = () => setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+            reader.onabort = () => setDiscoveryError('Reading the selected photo was cancelled. Choose it again and retry.')
+            reader.onload = () => {
+              if (typeof reader.result !== 'string') {
+                setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+                return
               }
+              setDiscoveryPreview(reader.result)
+              setDiscovery(null)
             }
-            reader.readAsDataURL(file)
-          }} onRemove={() => { setDiscoveryPreview(''); setDiscovery(null); setError('') }} onContinue={continueFromDiscovery} />}
+            try {
+              reader.readAsDataURL(file)
+            } catch {
+              setDiscoveryError('The selected photo could not be read. Choose it again and retry.')
+            }
+          }} onAnalyze={() => analyzeDiscoveryImage(discoveryPreview)} onRetry={() => analyzeDiscoveryImage(discoveryPreview)} onRemove={() => { setDiscoveryPreview(''); setDiscovery(null); setDiscoveryError('') }} onContinue={continueFromDiscovery} />}
           {screen === 'complete' && <CompleteScreen onReflect={() => go('reflection')} />}
           {screen === 'reflection' && <ReflectionScreen selected={selectedAfterMood} setSelected={setSelectedAfterMood} value={reflection} setValue={setReflection} onSave={saveReflection} />}
           {screen === 'history' && <HistoryScreen walks={state.walks} onStart={startFlow} />}
@@ -570,24 +638,30 @@ export default function Page() {
   )
 }
 
-function EmotionalJourney() {
-  const faces = ['😔', '😐', '😌', '😊']
-  const [faceIndex, setFaceIndex] = useState(0)
-  const [celebrate, setCelebrate] = useState(false)
+function HeroSlideshow() {
+  const [activeIndex, setActiveIndex] = useState(0)
 
   useEffect(() => {
-    const timer = window.setInterval(() => setFaceIndex((index) => (index + 1) % faces.length), 2600)
+    const timer = window.setInterval(() => {
+      setActiveIndex((index) => (index + 1) % HERO_SLIDES.length)
+    }, 2000)
     return () => window.clearInterval(timer)
   }, [])
 
-  return <div className="emotion-journey">
-    <div className="emoji-orbit orbit-one">🍃</div><div className="emoji-orbit orbit-two">🌿</div><div className="emoji-orbit orbit-three">🌸</div>
-    <div className="emotion-glow" aria-hidden="true" />
-    <button className={cn('main-emotion', faceIndex === 3 && 'main-emotion-happy', celebrate && 'main-emotion-celebrate')} onClick={() => { setCelebrate(false); requestAnimationFrame(() => setCelebrate(true)) }} aria-label="Animated emotional journey">
-      <span key={faceIndex} className="emotion-face">{faces[faceIndex]}</span>
-    </button>
-    <div className="emotion-copy"><span>{faceIndex < 3 ? 'From stressed...' : '...to refreshed.'}</span><div className="emotion-dots">{faces.map((face, index) => <i key={face} className={index === faceIndex ? 'active' : ''} />)}</div></div>
-    {celebrate && <div className="celebration-burst" aria-hidden="true"><span>🍃</span><span>🌱</span><span>🦋</span><span>☀️</span></div>}
+  return <div className="hero-art hero-slideshow" role="img" aria-label="Roamly photo slideshow">
+    {HERO_SLIDES.map((src, index) => (
+      <Image
+        key={src}
+        src={src}
+        alt=""
+        fill
+        loading="eager"
+        sizes="(max-width: 900px) 100vw, 50vw"
+        fetchPriority={index === 0 ? 'high' : 'auto'}
+        aria-hidden={index !== activeIndex}
+        className="hero-slide"
+      />
+    ))}
   </div>
 }
 
@@ -609,7 +683,19 @@ function OutdoorJourney() {
   return <section className="outdoor-journey"><div className="section-label">A small outdoor journey</div><div className="journey-steps">{stages.map(([emoji, label], index) => <div className={cn('journey-stage', index === active && 'journey-stage-active')} key={label}><span>{emoji}</span><strong>{label}</strong>{index < stages.length - 1 && <b>↓</b>}</div>)}</div></section>
 }
 
-function HomeScreen({ stats, onStart, onHow }: { stats: AppState['stats']; onStart: () => void; onHow: () => void }) {
+function HomeScreen({ stats, onStart, onHow, discoveryPreview, discovery, loading, error, onUpload, onAnalyze, onRetry, onRemove }: {
+  stats: AppState['stats']
+  onStart: () => void
+  onHow: () => void
+  discoveryPreview: string
+  discovery: Discovery | null
+  loading: boolean
+  error: string
+  onUpload: (file: File) => void
+  onAnalyze: () => void
+  onRetry: () => void
+  onRemove: () => void
+}) {
   return <div className="home-page">
     <section className="hero-section">
       <div className="hero-copy">
@@ -619,9 +705,15 @@ function HomeScreen({ stats, onStart, onHow }: { stats: AppState['stats']; onSta
         <div className="hero-actions"><button className="button button-primary button-large" onClick={onStart}>Start My Walk <ArrowRight /></button><button className="button button-ghost" onClick={onHow}>How It Works <ChevronRight /></button></div>
         <div className="hero-note"><span className="pulse-dot" /> The best AI interaction is sometimes walking away from the screen.</div>
       </div>
-      <div className="hero-art" aria-label="Illustration of a peaceful trail"><div className="floating-emoji float-leaf">🍃</div><div className="floating-emoji float-butterfly">🦋</div><div className="floating-emoji float-bird">🐦</div><div className="floating-emoji float-flower">🌸</div><div className="floating-emoji float-sun">☀️</div><EmotionalJourney />
-        <div className="sun-disc" /><div className="hill hill-back" /><div className="hill hill-front" /><div className="trail-line" /><div className="art-tree tree-one"><span /><span /><span /></div><div className="art-tree tree-two"><span /><span /><span /></div><div className="art-tree tree-three"><span /><span /><span /></div><div className="art-person"><div className="person-head" /><div className="person-body" /><div className="person-leg leg-a" /><div className="person-leg leg-b" /></div><div className="art-badge"><Sparkles /><span>made for<br /><strong>real life</strong></span></div>
+      <HeroSlideshow />
+    </section>
+    <section className="home-discovery-section" aria-labelledby="home-discovery-title">
+      <div className="home-discovery-heading">
+        <div className="section-label">A little outdoor curiosity</div>
+        <h2 id="home-discovery-title">What did you discover?</h2>
+        <p>Upload a photo or take one now. Local Gemma will help you notice what is really there.</p>
       </div>
+      <DiscoveryScreen preview={discoveryPreview} result={discovery} loading={loading} error={error} onUpload={onUpload} onAnalyze={onAnalyze} onRetry={onRetry} onRemove={onRemove} standalone />
     </section>
     <NatureLove />
     <OutdoorJourney />
@@ -740,8 +832,66 @@ function ActiveWalkScreen({ mission, route, tracking, onMission, onPause, onResu
 
 function MissionScreen({ mission, missionIndex, onComplete }: { mission: Mission; missionIndex: number; onComplete: () => void }) { return <div className="mission-full-page"><span className="mission-kicker">Next mission · {String(missionIndex + 1).padStart(2, '0')}</span><div className="mission-big-icon"><Target /></div><h1>{mission.instruction}</h1><p className="mission-big-description">{mission.description}</p><div className="mission-duration"><Activity /> About {mission.duration} minutes</div><div className="mission-quote"><Leaf /> <span>There&apos;s nothing to tap here.<br /><strong>Just go explore.</strong></span></div><button className="button button-dark button-large" onClick={onComplete}>I&apos;m ready <ArrowRight /></button></div> }
 
-function DiscoveryScreen({ preview, result, onUpload, onRemove, onContinue }: { preview: string; result: Discovery | null; onUpload: (file: File) => void; onRemove: () => void; onContinue: () => void }) {
-  return <div className="flow-page discovery-page"><PageHeader eyebrow="Real-world discovery" title="What did you discover?" description="Take a photo or upload one to let local Gemma analyze it." /><div className={cn('upload-card', preview && 'upload-card-uploaded')}><div className="upload-visual">{preview ? <img src={preview} alt="Your uploaded discovery" className="discovery-preview" /> : <><Camera /><span>Point your camera at something interesting</span></>}</div>{!preview ? <div className="upload-actions"><label className="button button-primary"><Camera /> Take Photo<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) onUpload(file) }} /></label><label className="button button-ghost"><Upload /> Upload Photo<input type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) onUpload(file) }} /></label></div> : <button className="button button-ghost" onClick={onRemove}>Remove or replace image</button>}</div>{result && <div className="discovery-result"><div className="result-top"><span className="ai-label"><Sparkles /> Local Gemma discovery</span>{typeof result.confidence === 'number' && result.confidence >= 55 && <span className="confidence">Gemma estimate · {result.confidence}%</span>}</div><h2><span>🌿</span> {result.title || result.name}</h2><p>{result.observation || result.description}</p>{result.uncertain && result.confidence < 55 && <p className="discovery-uncertainty" role="status">I can&apos;t confidently identify the exact subject, but I can still help you explore what you&apos;re seeing.</p>}{result.whyInteresting && <div className="fact-box"><Sparkles /><div><strong>Why it&apos;s interesting</strong><span>{result.whyInteresting}</span></div></div>}{result.lookCloser && <div className="fact-box"><Compass /><div><strong>Look closer</strong><span>{result.lookCloser}</span></div></div>}{result.microMission?.instruction && <div className="micro-mission"><Target /><div><strong>{result.microMission.title || 'Your next micro-mission'}</strong><span>{result.microMission.instruction}</span>{result.microMission.estimatedMinutes && <small>About {result.microMission.estimatedMinutes} minutes · {result.microMission.difficulty || 'easy'}</small>}</div></div>}{result.nextMission?.instruction && <div className="fact-box"><ArrowRight /><div><strong>How Roamly adapts next</strong><span>{result.nextMission.instruction}</span></div></div>}<p className="discovery-disclaimer">A short glance, then back to the world around you.</p><button className="button button-primary" onClick={onContinue}>Continue Walk <ArrowRight /></button></div>}<div className="discovery-footer"><Shield /> Images are sent to your local Ollama model for analysis.</div></div>
+function DiscoveryScreen({ preview, result, loading, error, onUpload, onAnalyze, onRetry, onRemove, onContinue, standalone = false }: {
+  preview: string
+  result: Discovery | null
+  loading: boolean
+  error: string
+  onUpload: (file: File) => void
+  onAnalyze: () => void
+  onRetry: () => void
+  onRemove: () => void
+  onContinue?: () => void
+  standalone?: boolean
+}) {
+  const uploadInputRef = useRef<HTMLInputElement>(null)
+  const cameraInputRef = useRef<HTMLInputElement>(null)
+
+  const handleFile = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0]
+    event.currentTarget.value = ''
+    if (file) onUpload(file)
+  }
+
+  return <div className={cn('discovery-page', !standalone && 'flow-page')}>
+    {!standalone && <PageHeader eyebrow="Real-world discovery" title="What did you discover?" description="Take a photo or upload one to let local Gemma analyze it." />}
+    <div className={cn('upload-card', preview && 'upload-card-uploaded')}>
+      <div className="upload-visual">{preview ? <img src={preview} alt="Your uploaded discovery" className="discovery-preview" /> : <><Camera /><span>Point your camera at something interesting</span></>}</div>
+      {!preview
+        ? <div className="upload-actions">
+          <input ref={cameraInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" capture="environment" disabled={loading} onChange={handleFile} aria-label="Take a photo for discovery" />
+          <input ref={uploadInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={loading} onChange={handleFile} aria-label="Choose a discovery image" />
+          <button type="button" className="button button-primary" disabled={loading} onClick={() => cameraInputRef.current?.click()}><Camera /> Take Photo</button>
+          <button type="button" className="button button-ghost" disabled={loading} onClick={() => uploadInputRef.current?.click()}><Upload /> Upload Image</button>
+        </div>
+        : <div className="upload-actions">
+          <button type="button" className="button button-primary" disabled={loading} onClick={onAnalyze}>{loading ? 'Analyzing…' : 'Analyze with AI'} <Sparkles /></button>
+          <input ref={cameraInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" capture="environment" disabled={loading} onChange={handleFile} aria-label="Take a replacement photo" />
+          <input ref={uploadInputRef} className="sr-only" type="file" accept="image/jpeg,image/jpg,image/png,image/webp,.jpg,.jpeg,.png,.webp" disabled={loading} onChange={handleFile} aria-label="Choose a replacement discovery image" />
+          <button type="button" className="button button-ghost" disabled={loading} onClick={() => cameraInputRef.current?.click()}><Camera /> Take another</button>
+          <button type="button" className="button button-ghost" disabled={loading} onClick={() => uploadInputRef.current?.click()}><Upload /> Change Image</button>
+          <button type="button" className="button button-ghost" disabled={loading} onClick={onRemove}>Remove Image</button>
+        </div>}
+    </div>
+    {error && <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">
+      <span>{error}</span>
+      {preview && !result && <button className="button button-ghost" disabled={loading} onClick={onRetry}>Retry analysis</button>}
+    </div>}
+    {loading && <p className="mt-4 text-sm" role="status">Local Gemma is analyzing the actual photo. This may take a moment.</p>}
+    {result && <div className="discovery-result">
+      <div className="result-top"><span className="ai-label"><Sparkles /> Local Gemma discovery</span>{typeof result.confidence === 'number' && result.confidence >= 55 && <span className="confidence">Gemma estimate · {result.confidence}%</span>}</div>
+      <h2><span>🌿</span> {result.title || result.name}</h2>
+      <p>{result.observation || result.description}</p>
+      {result.uncertain && result.confidence < 55 && <p className="discovery-uncertainty" role="status">I can&apos;t confidently identify the exact subject, but I can still help you explore what you&apos;re seeing.</p>}
+      {result.whyInteresting && <div className="fact-box"><Sparkles /><div><strong>Why it&apos;s interesting</strong><span>{result.whyInteresting}</span></div></div>}
+      {result.lookCloser && <div className="fact-box"><Compass /><div><strong>Look closer</strong><span>{result.lookCloser}</span></div></div>}
+      {result.microMission?.instruction && <div className="micro-mission"><Target /><div><strong>{result.microMission.title || 'Your next micro-mission'}</strong><span>{result.microMission.instruction}</span>{result.microMission.estimatedMinutes && <small>About {result.microMission.estimatedMinutes} minutes · {result.microMission.difficulty || 'easy'}</small>}</div></div>}
+      {result.nextMission?.instruction && <div className="fact-box"><ArrowRight /><div><strong>How Roamly adapts next</strong><span>{result.nextMission.instruction}</span></div></div>}
+      <p className="discovery-disclaimer">A short glance, then back to the world around you.</p>
+      {onContinue && <button className="button button-primary" onClick={onContinue}>Continue Walk <ArrowRight /></button>}
+    </div>}
+    <div className="discovery-footer"><Shield /> Images are sent to your local Ollama model for analysis.</div>
+  </div>
 }
 
 function CompleteScreen({ onReflect }: { onReflect: () => void }) { return <div className="complete-page"><div className="complete-mark"><Leaf /></div><div className="eyebrow">That&apos;s a wrap</div><h1>Walk complete <span>🌿</span></h1><p className="complete-subtitle">You made space for something real today.</p><div className="complete-summary"><Sparkles /><p>Your walk is saved. Take a moment to reflect on how it felt.</p></div><button className="button button-dark button-large" onClick={onReflect}>Reflect on my walk <ArrowRight /></button></div> }

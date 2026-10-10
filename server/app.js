@@ -5,22 +5,66 @@ const Discovery = require('./models/Discovery');
 const Reflection = require('./models/Reflection');
 const mongoose = require('mongoose');
 const { generatePersonalizedRoute, generateMissions } = require('./services/routeService');
-const { analyzeDiscovery, generateMission, generateWalkSummary } = require('./services/aiService');
+const { analyzeDiscovery, generateMission, generateWalkSummary, getAIHealthStatus } = require('./services/aiService');
+const { prepareDiscoveryImage } = require('./services/imageService');
 
 const app = express();
+app.disable('x-powered-by');
 const allowedOrigins = [...new Set([
   'http://localhost:3000',
+  'http://127.0.0.1:3000',
   'http://192.168.29.147:3000',
   process.env.CLIENT_URL,
 ].filter(Boolean))];
-app.use(cors({ origin: allowedOrigins }));
-app.use(express.json({ limit: '2mb' }));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: '18mb' }));
 
 const success = (res, data, status = 200) => res.status(status).json({ success: true, data });
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const validObjectId = (value) => mongoose.isValidObjectId(value);
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'roamly-api' }));
+app.get('/api/health', (_req, res) => res.status(200).json({ ok: true, status: 'healthy' }));
+
+app.get('/api/diagnostics', async (_req, res) => {
+  const mongoReadyState = mongoose.connection.readyState;
+  const mongoStatus = mongoReadyState === 1 ? 'connected' : mongoReadyState === 2 ? 'connecting' : 'disconnected';
+
+  let ollamaStatus;
+  try {
+    ollamaStatus = await getAIHealthStatus();
+  } catch (error) {
+    ollamaStatus = {
+      provider: 'ollama',
+      model: process.env.OLLAMA_MODEL || 'gemma3:4b',
+      status: 'unavailable',
+      modelAvailable: false,
+      reason: error?.message || 'unknown error',
+    };
+  }
+
+  const isHealthy = mongoStatus === 'connected' && ollamaStatus?.status === 'healthy';
+  res.status(200).json({
+    ok: isHealthy,
+    status: isHealthy ? 'healthy' : 'degraded',
+    services: {
+      mongodb: {
+        status: mongoStatus,
+        readyState: mongoReadyState,
+      },
+      ollama: ollamaStatus,
+    },
+  });
+});
 
 app.post('/api/walks', asyncRoute(async (req, res) => {
   const startedAt = Date.now();
@@ -158,38 +202,25 @@ app.post('/api/missions/:missionId/complete', asyncRoute(async (req, res) => {
   return success(res, walk.missions.find((mission) => mission.id === req.params.missionId));
 }));
 
+app.post('/api/discoveries/analyze', asyncRoute(async (req, res) => {
+  const image = await prepareDiscoveryImage(req.body?.image);
+  return success(res, await analyzeDiscovery(image));
+}));
+
 app.post('/api/walks/:walkId/discoveries', asyncRoute(async (req, res) => {
-  if (typeof req.body.image !== 'string' || !/^data:image\/(?:jpeg|png|webp);base64,/.test(req.body.image)) {
-    return res.status(400).json({ success: false, message: 'An image is required for discovery analysis.' });
-  }
   if (!validObjectId(req.params.walkId)) return res.status(400).json({ success: false, message: 'Invalid walk ID.' });
+  const image = await prepareDiscoveryImage(req.body?.image);
   const walk = await Walk.findById(req.params.walkId);
   if (!walk) return res.status(404).json({ success: false, message: 'Walk not found' });
   if (req.body.missionId && await Discovery.exists({ walkId: walk._id, missionId: req.body.missionId })) {
     return res.status(409).json({ success: false, message: 'This mission already has a discovery.' });
   }
-  const previousDiscoveries = await Discovery.find({ walkId: walk._id })
-    .select('title name category observation description whyInteresting')
-    .lean();
   const currentMission = walk.missions.find((mission) => mission.id === req.body.missionId);
-  const analysis = await analyzeDiscovery(req.body.image, {
-    mood: walk.mood,
-    customMood: walk.customMood,
-    preferences: walk.preferences,
-    currentWalk: {
-      id: walk._id.toString(),
-      status: walk.status,
-      distanceTravelled: walk.distanceTravelled,
-      currentLocation: walk.currentLocation,
-    },
-    route: walk.route,
-    mission: currentMission,
-    previousDiscoveries,
-  });
+  const analysis = await analyzeDiscovery(image);
   const savedDiscovery = await Discovery.create({
     walkId: walk._id,
     missionId: req.body.missionId,
-    image: req.body.image,
+    image,
     ...analysis,
   });
   const nextMission = walk.missions.find((mission) => mission.order === (currentMission?.order || 0) + 1);
@@ -198,7 +229,6 @@ app.post('/api/walks/:walkId/discoveries', asyncRoute(async (req, res) => {
       preferences: walk.preferences,
       route: walk.route,
       discovery: analysis,
-      previousDiscoveries,
       completedMissions: walk.missions.filter((item) => item.completed),
       missionNumber: nextMission.order,
     });
@@ -217,7 +247,10 @@ app.post('/api/walks/:walkId/discoveries', asyncRoute(async (req, res) => {
         },
       },
     );
-    savedDiscovery.nextMission = mission.instruction;
+    savedDiscovery.nextMission = {
+      type: mission.type,
+      instruction: mission.instruction,
+    };
     await savedDiscovery.save();
   }
   return success(res, savedDiscovery, 201);
@@ -269,10 +302,30 @@ app.get('/api/profile/stats', asyncRoute(async (_req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(error.statusCode || 500).json({
+  const isInvalidJson = error.type === 'entity.parse.failed';
+  const isDatabaseError = error.name?.startsWith('Mongo') || error.name?.startsWith('Mongoose');
+  const statusCode = error.statusCode || error.status || (isInvalidJson ? 400 : isDatabaseError ? 503 : 500);
+  const errorCode = typeof error.code === 'string' ? error.code : undefined;
+  const code = errorCode
+    ? errorCode
+    : isInvalidJson
+      ? 'INVALID_JSON'
+      : isDatabaseError
+        ? 'DATABASE_UNAVAILABLE'
+        : statusCode >= 500
+          ? 'INTERNAL_SERVER_ERROR'
+          : 'REQUEST_ERROR';
+  const message = isInvalidJson
+    ? 'Request body must be valid JSON.'
+    : isDatabaseError
+      ? 'MongoDB is unavailable. Check the local database service and try again.'
+      : statusCode >= 500 && !errorCode
+        ? 'Roamly could not complete the request. Please try again.'
+        : error.message || 'Something went wrong.';
+  res.status(statusCode).json({
     success: false,
-    code: error.code || (error.statusCode === 503 && /Gemma/i.test(error.message) ? 'GEMMA_UNAVAILABLE' : error.statusCode === 503 ? 'REAL_ROUTE_UNAVAILABLE' : 'DATABASE_ERROR'),
-    message: error.message || 'Something went wrong',
+    code,
+    message,
   });
 });
 

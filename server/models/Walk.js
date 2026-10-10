@@ -1,9 +1,15 @@
 const mongoose = require('mongoose');
 
 const pointSchema = new mongoose.Schema({ id: String, name: String, lat: Number, lng: Number, description: String, characteristics: [String] }, { _id: false });
+const destinationSchema = new mongoose.Schema({
+  id: String, name: String, lat: Number, lng: Number, description: String, characteristics: [String],
+  category: String, distance: Number, walkingDuration: Number, popularityScore: Number,
+  moodFitScore: Number, publicAccess: Boolean, isRecommended: Boolean,
+}, { _id: false });
 const routeSchema = new mongoose.Schema({
   id: String, title: String, duration: Number, distance: Number, difficulty: String,
-  greenery: String, crowd: String, startPoint: pointSchema, destination: pointSchema,
+  greenery: String, crowd: String, startPoint: pointSchema, destination: destinationSchema,
+  primaryDestination: destinationSchema, destinations: [destinationSchema],
   checkpoints: [pointSchema], aiReasoning: String, destinationAddress: String,
   experience: {
     experienceTitle: String,

@@ -4,31 +4,119 @@ const API_URL = `${(process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/ap
   .trim()
   .replace(/(?:\/api)+\/?$/i, '')
   .replace(/\/+$/, '')}/api`
+const API_REQUEST_TIMEOUT_MS = 150_000
+const API_PROBE_TIMEOUT_MS = 2_000
 
 interface ApiResponse<T> { success: boolean; data: T; message?: string; code?: string }
 
-interface HealthResponse { status: 'ok'; service: 'roamly-api' }
+interface HealthResponse { ok: true; status: 'healthy' }
+
+function getSafeUrl(url: string): string {
+  const safeUrl = new URL(url)
+  safeUrl.username = ''
+  safeUrl.password = ''
+  safeUrl.search = ''
+  safeUrl.hash = ''
+  return safeUrl.toString()
+}
 
 function getApiUrl(path: string): string {
   const normalizedPath = path.replace(/^\/+/, '').replace(/^(?:api\/)+/i, '')
-  return `${API_URL}/${normalizedPath}`
+  try {
+    return new URL(normalizedPath, `${API_URL}/`).toString()
+  } catch {
+    throw new Error('The configured NEXT_PUBLIC_API_URL is invalid.')
+  }
+}
+
+async function isApiReachableWithoutCors(): Promise<boolean> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), API_PROBE_TIMEOUT_MS)
+  try {
+    // A resolved opaque response confirms transport without depending on the API's CORS headers.
+    await fetch(getApiUrl('/health'), {
+      method: 'GET',
+      mode: 'no-cors',
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+    return true
+  } catch (error) {
+    console.warn('[API] Opaque reachability probe failed', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    })
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function fetchJson(path: string, options?: RequestInit): Promise<{ response: Response; payload: unknown }> {
+  const url = getApiUrl(path)
+  if (path === '/health' && process.env.NODE_ENV === 'development') {
+    console.info('[API] Health check request', getSafeUrl(url))
+  }
+
+  const controller = new AbortController()
+  const callerSignal = options?.signal
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, API_REQUEST_TIMEOUT_MS)
+  const abortFromCaller = () => controller.abort()
+  if (callerSignal?.aborted) controller.abort()
+  else callerSignal?.addEventListener('abort', abortFromCaller, { once: true })
+
   let response: Response
   try {
-    response = await fetch(getApiUrl(path), {
+    response = await fetch(url, {
       ...options,
       headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
+      signal: controller.signal,
     })
   } catch (error) {
-    console.error('[API] Network request failed', path, error)
-    throw new Error('Roamly couldn\'t reach the server. Please make sure the backend is running.')
+    if (timedOut) {
+      const timeoutError = new Error(`The Roamly API request timed out after ${API_REQUEST_TIMEOUT_MS / 1000} seconds.`)
+      timeoutError.name = 'API_TIMEOUT'
+      console.error('[API] Request timed out', { path, url: getSafeUrl(url) })
+      throw timeoutError
+    }
+    if (callerSignal?.aborted) throw error
+
+    const apiReachable = await isApiReachableWithoutCors()
+    const errorName = apiReachable ? 'CORS_ERROR' : 'CONNECTION_ERROR'
+    const origin = typeof window === 'undefined' ? 'the current origin' : window.location.origin
+    const message = apiReachable
+      ? `The Roamly API is reachable, but the browser blocked this request. Check the backend CORS configuration for ${origin}.`
+      : `Could not connect to the Roamly API at ${getSafeUrl(url)}. The backend may be stopped or the connection refused; also check browser and network policies.`
+    console.error('[API] Network request failed', {
+      path,
+      url: getSafeUrl(url),
+      errorName,
+      causeName: error instanceof Error ? error.name : 'UnknownError',
+    })
+    const requestError = new Error(message)
+    requestError.name = errorName
+    throw requestError
+  } finally {
+    clearTimeout(timeout)
+    callerSignal?.removeEventListener('abort', abortFromCaller)
+  }
+
+  if (path === '/health' && !response.ok) {
+    console.error('[API] Health check returned an HTTP error', { status: response.status })
+    throw new Error(`The backend health check returned HTTP ${response.status}.`)
   }
 
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.toLowerCase().includes('json')) {
     console.error('[API] Expected a JSON response', { path, status: response.status, contentType })
+    if (!response.ok) {
+      const httpError = new Error(`The Roamly API returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}.`)
+      httpError.name = `HTTP_${response.status}`
+      throw httpError
+    }
     throw new Error('Roamly received a non-JSON response. Check that NEXT_PUBLIC_API_URL points to the backend URL ending in /api.')
   }
 
@@ -67,10 +155,18 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       REAL_ROUTE_UNAVAILABLE: 'No real walking route is available from this location. Try again nearby.',
       REAL_PLACE_UNAVAILABLE: 'Roamly couldn\'t find a suitable nearby outdoor place right now. Please try again.',
       NO_PUBLIC_DESTINATION_AVAILABLE: 'Roamly couldn\'t find a public recreational destination within your selected walking range. Please try again nearby.',
+      PLACE_PROVIDER_UNAVAILABLE: 'OpenStreetMap could not verify nearby public places right now. Please retry in a moment.',
       GEMMA_UNAVAILABLE: 'Local Gemma AI is unavailable. Please make sure Ollama is running.',
+      GEMMA_TIMEOUT: 'Local Gemma took too long to analyze this image. Try again with a smaller image.',
+      GEMMA_CONTEXT_LIMIT: 'Local Gemma could not fit this image analysis into its context window. Try a smaller image.',
+      GEMMA_INVALID_RESPONSE: 'Local Gemma returned an unreadable analysis. Please retry the image.',
+      GEMMA_REQUEST_FAILED: 'Local Gemma could not analyze this image. Please retry.',
+      INVALID_IMAGE: 'Choose a readable JPEG, PNG, or WebP image no larger than 12 MB.',
       DATABASE_ERROR: 'Your walk could not be saved. Please try again.',
     }
-    const error = new Error(friendlyMessages[code] || message)
+    const friendlyMessage = friendlyMessages[code]
+    const detail = friendlyMessage && friendlyMessage !== message ? `: ${message}` : ''
+    const error = new Error(`${friendlyMessage || message} (HTTP ${response.status}${detail})`)
     error.name = code
     throw error
   }
@@ -115,11 +211,18 @@ export const createWalk = async (preferences: UserPreferences, location: { latit
 )
 export const checkHealth = async (): Promise<HealthResponse> => {
   const { response, payload } = await fetchJson('/health')
-  if (!response.ok || typeof payload !== 'object' || payload === null
-    || !('status' in payload) || payload.status !== 'ok'
-    || !('service' in payload) || payload.service !== 'roamly-api') {
-    console.error('[API] Health check failed', { status: response.status, payload })
+  if (typeof payload !== 'object' || payload === null) {
+    console.error('[API] Health check returned an invalid response', { status: response.status })
+    throw new Error('Roamly received an invalid health response from the backend.')
+  }
+  if ('ok' in payload && payload.ok === false) {
+    console.error('[API] Backend reported an unhealthy response', { status: response.status })
     throw new Error('Roamly backend health check failed.')
+  }
+  if (!('ok' in payload) || payload.ok !== true
+    || !('status' in payload) || payload.status !== 'healthy') {
+    console.error('[API] Health check returned an unexpected response shape', { status: response.status })
+    throw new Error('Roamly received an unexpected health response from the backend.')
   }
   return payload as HealthResponse
 }
@@ -134,6 +237,10 @@ export const rerouteWalk = (id: string, location: { latitude: number; longitude:
 export const getMissions = (walkId: string) => request<Mission[]>(`/walks/${walkId}/missions`)
 export const completeMission = (missionId: string) => request<Mission>(`/missions/${missionId}/complete`, { method: 'POST' })
 export const createDiscovery = (walkId: string, discovery: Partial<Discovery> & { image: string }) => request<Discovery>(`/walks/${walkId}/discoveries`, { method: 'POST', body: JSON.stringify(discovery) })
+export const analyzeDiscoveryImage = (image: string) => request<Discovery>('/discoveries/analyze', {
+  method: 'POST',
+  body: JSON.stringify({ image }),
+})
 export const getDiscoveries = (walkId: string) => request<Discovery[]>(`/walks/${walkId}/discoveries`)
 export const saveReflection = (walkId: string, reflection: object) => request('/walks/' + walkId + '/reflection', { method: 'POST', body: JSON.stringify(reflection) })
 export const getWalkHistory = async () => {

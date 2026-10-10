@@ -7,8 +7,8 @@ const NOMINATIM_BASE_URL = process.env.NOMINATIM_BASE_URL || 'https://nominatim.
 const OVERPASS_BASE_URL = process.env.OVERPASS_BASE_URL || 'https://overpass-api.de/api/interpreter';
 const OVERPASS_FALLBACK_URL = process.env.OVERPASS_FALLBACK_URL || 'https://overpass.private.coffee/api/interpreter';
 const OVERPASS_SECONDARY_URL = process.env.OVERPASS_SECONDARY_URL || 'https://overpass.kumi.systems/api/interpreter';
-const PLACE_SEARCH_DEADLINE_MS = 8000;
-const PLACE_PROVIDER_TIMEOUT_MS = 2200;
+const PLACE_SEARCH_DEADLINE_MS = 30000;
+const PLACE_PROVIDER_TIMEOUT_MS = 12000;
 const OLLAMA_KEEP_ALIVE = '10m';
 const PUBLIC_PLACE_CATEGORIES = new Set([
   'park', 'garden', 'playground', 'recreation_ground', 'pitch', 'plaza',
@@ -16,6 +16,7 @@ const PUBLIC_PLACE_CATEGORIES = new Set([
   'track',
 ]);
 const INSTITUTIONAL_PATTERN = /\b(?:iit|university|college|institute|institution|department|faculty|laboratory|lab|research|campus|hostel|office|government office|school|hospital|police|industrial|company|corporate|training centre|training center|academic|administrative|engineering|hydrology|science|military|cantonment)\b/i;
+const PUBLIC_PARKS_OPERATOR_PATTERN = /\b(?:city|municipal|county)\b.*\b(?:department of parks?|parks?(?:\s+(?:and|&)\s+recreation)?)\b/i;
 const GENERIC_PRIVATE_PLACE_PATTERN = /\b(?:lawn|garden|ground|green|field|recreation|pitch|track)\b/i;
 const PUBLIC_IDENTITY_PATTERN = /\b(?:public|municipal|city|central|nagar|palika|playground|ghat|promenade|walking track|riverfront|riverside|viewpoint|picnic)\b/i;
 const RESTRICTED_ACCESS = new Set(['private', 'no', 'customers', 'members', 'permit', 'permissive']);
@@ -92,7 +93,7 @@ function placeQuery(preferences, location, radius, recommendedPlaceType) {
     `nwr(around:${radius},${location.latitude},${location.longitude})["waterway"="riverbank"];`,
     `nwr(around:${radius},${location.latitude},${location.longitude})["highway"="pedestrian"];`,
   ].join('');
-  return `[out:json][timeout:2];(${selectors});out center tags;`;
+  return `[out:json][timeout:10];(${selectors});out center tags;`;
 }
 
 function providerUrls() {
@@ -157,7 +158,7 @@ function normalizeNominatimCandidates(payload) {
       longitude: Number(place.lon),
       category,
       characteristics: [category, place.class].filter(Boolean),
-      tags: { type: category, class: place.class, access: place.extratags?.access },
+      tags: { ...place.extratags, type: category, class: place.class },
     };
   }).filter((place) => supportedTypes.has(place.category)
     && typeof place.name === 'string' && place.name.trim()
@@ -176,6 +177,7 @@ async function fetchNominatim(endpoint, preferences, location, radius, remaining
     bounded: '1',
     limit: '20',
     addressdetails: '1',
+    extratags: '1',
   });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.min(PLACE_PROVIDER_TIMEOUT_MS, remainingMs));
@@ -265,11 +267,12 @@ function publicAccessScoreFor(place) {
 
 function hasInstitutionalAssociation(place) {
   const tags = place.tags || {};
+  const operators = [tags.operator, tags.owner].filter(Boolean);
+  const associatedOperators = operators.filter((operator) => !isPublicParksOperator(operator));
   const associatedText = [
     place.name,
     place.category,
-    tags.operator,
-    tags.owner,
+    ...associatedOperators,
     tags['operator:type'],
     tags.amenity,
     tags.landuse,
@@ -291,11 +294,23 @@ function hasStrongPublicEvidence(place) {
   const category = String(place.category || '').toLowerCase();
   const explicitPublicCategory = ['playground', 'pedestrian', 'viewpoint', 'riverbank'].includes(category)
     && (publicName || publicTag);
+  const publiclyAccessibleGarden = category === 'garden' && (access === 'public' || access === 'yes');
   const genericAmenity = GENERIC_PRIVATE_PLACE_PATTERN.test(place.name);
   const namedAmenityWithoutPublicOwner = genericAmenity
     && !publicName
+    && !publiclyAccessibleGarden
     && !/\b(?:municipal|city|public|nagar|palika|government)\b/i.test(operator);
   return !namedAmenityWithoutPublicOwner && (publicTag || publicName || explicitPublicCategory);
+}
+
+function isPublicParksOperator(operator) {
+  return typeof operator === 'string' && PUBLIC_PARKS_OPERATOR_PATTERN.test(operator);
+}
+
+function hasVerifiedPublicGardenAccess(place) {
+  const tags = place.tags || {};
+  return String(place.category || '').toLowerCase() === 'garden'
+    && ['public', 'yes'].includes(String(tags.access || tags.public_access || '').toLowerCase());
 }
 
 function publicAccessScoreFor(place) {
@@ -327,7 +342,7 @@ function contextQuery(candidates) {
     `nwr(around:150,${place.latitude},${place.longitude})["boundary"="campus"];`,
     `nwr(around:150,${place.latitude},${place.longitude})["name"~"IIT|university|college|institute|campus|department|faculty|research|laboratory|school|hospital|police|military|cantonment",i];`,
   ].join('')).join('');
-  return `[out:json][timeout:2];(${selectors});out center tags;`;
+  return `[out:json][timeout:10];(${selectors});out center tags;`;
 }
 
 function contextFeatureCoordinates(feature) {
@@ -346,8 +361,13 @@ function distanceBetweenPlaces(first, second) {
 
 async function enrichInstitutionalContext(candidates, endpoint, remainingMs) {
   const uncached = candidates.filter((place) => !institutionalContextCache.has(`${place.latitude.toFixed(5)},${place.longitude.toFixed(5)}`));
-  const needsContext = uncached.filter((place) => GENERIC_PRIVATE_PLACE_PATTERN.test(place.name)
-    || !hasStrongPublicEvidence(place));
+  const needsContext = uncached.filter((place) => {
+    const tags = place.tags || {};
+    const hasVerifiedPublicOperator = [tags.operator, tags.owner].some(isPublicParksOperator);
+    const alreadyVerifiedPublic = hasVerifiedPublicGardenAccess(place) || hasVerifiedPublicOperator;
+    return (GENERIC_PRIVATE_PLACE_PATTERN.test(place.name) && !alreadyVerifiedPublic)
+      || !hasStrongPublicEvidence(place);
+  });
   for (const place of uncached.filter((candidate) => !needsContext.includes(candidate))) {
     institutionalContextCache.set(`${place.latitude.toFixed(5)},${place.longitude.toFixed(5)}`, {
       institutionalNearby: false,
@@ -388,6 +408,7 @@ async function findNearbyPlaces(preferences, location, recommendedPlaceType) {
   const initialRadius = Math.min(3200, Math.max(1200, (Number(preferences.distance) || 2) * 1200));
   const radii = [initialRadius, Math.min(5000, Math.round(initialRadius * 1.6))];
   let candidates = [];
+  let placeProviderUnavailable = false;
   for (const radius of radii) {
     for (const provider of providerUrls()) {
       const remainingMs = deadline - Date.now();
@@ -407,6 +428,7 @@ async function findNearbyPlaces(preferences, location, recommendedPlaceType) {
           ...contextualCandidates.filter(isPublicRecreationalPlace),
         ]);
       } catch (error) {
+        if (provider.kind === 'overpass') placeProviderUnavailable = true;
         console.warn(`[PLACES] ${provider.kind} failed: ${provider.url} (${error.name === 'AbortError' ? 'timeout' : error.message})`);
       }
     }
@@ -414,8 +436,10 @@ async function findNearbyPlaces(preferences, location, recommendedPlaceType) {
   }
   console.info(`[Roamly timing] Place search: ${Date.now() - startedAt}ms`);
   if (!candidates.length) {
-    const error = new Error('No suitable public recreational destination is available within the requested walking range.');
-    error.code = 'NO_PUBLIC_DESTINATION_AVAILABLE';
+    const error = placeProviderUnavailable
+      ? new Error('OpenStreetMap could not verify nearby public places right now. Please retry in a moment.')
+      : new Error('No suitable public recreational destination is available within the requested walking range.');
+    error.code = placeProviderUnavailable ? 'PLACE_PROVIDER_UNAVAILABLE' : 'NO_PUBLIC_DESTINATION_AVAILABLE';
     error.statusCode = 503;
     throw error;
   }
@@ -588,6 +612,7 @@ module.exports = {
   generatePersonalizedRoute,
   generateMissions,
   findNearbyPlaces,
+  normalizeNominatimCandidates,
   isPublicRecreationalPlace,
   rankPlaces,
   deduplicatePlaces,
