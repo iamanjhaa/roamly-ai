@@ -363,10 +363,6 @@ Contributions are welcome.
 
 Ideas for contributions include better place filtering, routing reliability, accessibility, test coverage, and improvements to the mood-based discovery experience.
 
-## 📄 License
-
-Add your chosen open-source license to the repository before publishing a license claim here. Until a license file is present, do not assume that the project is released under a particular license.
-
 ## 👣 The Roamly Philosophy
 
 > **Technology should not always ask for more of our attention. Sometimes, it should help us give our attention back to the world.**
